@@ -70,8 +70,11 @@ class TO_Casadi:
         for x,xg in zip(xs,init_x_TO): opti.set_initial(x,xg)
         for u,ug in zip(us,init_u_TO): opti.set_initial(u,ug)
 
-        # Set solver options
-        opts = {'ipopt.linear_solver':'ma57', 'ipopt.sb': 'yes','ipopt.print_level': 0, 'print_time': 0} #, 'ipopt.max_iter': 500} 
+        # Set solver options NOTE NEW
+        #opts = {'ipopt.linear_solver':'ma57', 'ipopt.sb': 'yes','ipopt.print_level': 0, 'print_time': 0} 
+
+        opts = {'ipopt.linear_solver':'mumps', 'ipopt.sb': 'yes','ipopt.print_level': 0, 'print_time': 0} # MODIFIED
+        
         opti.solver("ipopt", opts) 
         
         try:

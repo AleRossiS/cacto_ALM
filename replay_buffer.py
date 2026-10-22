@@ -2,7 +2,7 @@ import math
 import random
 import numpy as np
 import tensorflow as tf
-from stable_baselines.common.segment_tree import SumSegmentTree, MinSegmentTree
+from segment_tree import SumSegmentTree, MinSegmentTree
 
 
 class ReplayBuffer(object):
