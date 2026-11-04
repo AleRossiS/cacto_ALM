@@ -28,6 +28,7 @@ def init_buffer(conf) -> ReplayBufferJAX:
     """Initialize a ReplayBufferJAX instance."""
     total_dim = 3 * conf.nb_state + 2 # (x, partial/total_cost_to_go, x_next, V_x, done_flag)
 
+    # Matric of REPLAY_SIZE rows and total_dim columns, initialized to zeros
     storage = jnp.zeros((conf.REPLAY_SIZE, total_dim), dtype=jnp.float32)
 
     return ReplayBufferJAX(

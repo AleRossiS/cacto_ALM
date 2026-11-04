@@ -49,7 +49,11 @@ def parse_args():
                         help="Sobolev training - weight of the value related error (higher means more importance given to the value related error)")
 
     parser.add_argument('--BICSf',                            type=float, default=0,
-                        help="BICS factor - percentage of the initial TO states sampled from the second cycle onwards")
+                        help="BICS factor - percentage of the initial TO states biased sampled from the second cycle onwards")
+
+    # NOTE NEW: arg that choses the % of the initial TO states randomly sampled from the second cycle onwards
+    parser.add_argument('--unif-f',                            type=float, default=0,
+                        help="Uniform factor - percentage of the initial TO states randomly sampled from the second cycle onwards")
     
     args = parser.parse_args()
     dict_args = vars(args)
@@ -86,6 +90,7 @@ if __name__ == '__main__':
     w_S = args['w_S']
 
     BICS_factor = args['BICSf']
+    unif_factor = args['unif_f']
     #########################################################
 
 
@@ -333,14 +338,67 @@ if __name__ == '__main__':
         # Select n_BICS states with highest combined score
         return sorted_init_rand_state_t[-n_BICS:, :], sorted_init_rand_state_t[-n_BICS:, -1]
 
+    # NOTE OLD: one_update_step and run_all_updates_jit stacking the actor params at every step of the scan
+    # def one_update_step(carry, step_idx):
+    #     (key, actor_state, critic_state, buffer, n_updates) = carry
+
+    #     # Mask: whether this step is active
+    #     do_update = step_idx < n_updates
+
+    #     def do_update_fn(carry):
+    #         (key, actor_state, critic_state, buffer, n_updates) = carry
+
+    #         key, subkey = jax.random.split(key)
+
+    #         state_b, rtg_b, state_next_b, dVdx_b, d_b, w_b = buffer_sample(buffer, subkey, batch_size=conf.BATCH_SIZE, n_sample=1)
+
+    #         state_b, state_next_b, rtg_b, dVdx_b, d_b = state_b[0], state_next_b[0], rtg_b[0], dVdx_b[0], d_b[0]
+
+    #         critic_state, critic_loss = update_critic( critic_state, state_b, state_next_b, rtg_b, dVdx_b, d_b)
+
+    #         actor_state, actor_loss = update_actor(actor_state, critic_state, state_b)
+
+    #         return (key, actor_state, critic_state, buffer, n_updates), (critic_loss, actor_loss, actor_state.params)
+
+    #     def skip_update_fn(carry):
+    #         key, actor_state, critic_state, buffer, n_updates = carry
+    #         return carry, (0.0, 0.0, actor_state.params)
+
+    #     new_carry, losses = jax.lax.cond(do_update, do_update_fn, skip_update_fn, carry)
+
+    #     return new_carry, losses
+
+    # @partial(jax.jit, static_argnames=("MAX_UPDATES",))
+    # def run_all_updates_jit(
+    #     key,
+    #     actor_state,
+    #     critic_state,
+    #     buffer,
+    #     n_updates,
+    #     MAX_UPDATES,
+    # ):
+    #     init = (key, actor_state, critic_state, buffer, n_updates)
+
+    #     steps = jnp.arange(MAX_UPDATES)
+
+    #     final_carry, (critic_losses, actor_losses, actor_state_params) = jax.lax.scan(one_update_step, init, steps)
+
+    #     return final_carry, (critic_losses, actor_losses, actor_state_params)
+
+
+    # NOTE NEW: the actor params are no longer returned by the scan at every step (15000 stacked copies ~ 4 GB of RAM).
+    # Only the params at the save steps are stored in the small buffer `saved` (N_SLOTS copies), carried through the scan.
+    SAVE_INT = int(conf.save_interval) if conf.save_interval != float('inf') else 10**9    # Save interval (finite value also if saving is disabled)
+    N_SLOTS = int(max(conf.UPDATE_LOOPS)) // SAVE_INT + 1                                      # Max number of saves in a single call of run_all_updates_jit
+
     def one_update_step(carry, step_idx):
-        (key, actor_state, critic_state, buffer, n_updates) = carry
+        (key, actor_state, critic_state, buffer, n_updates, saved, offset) = carry
 
         # Mask: whether this step is active
         do_update = step_idx < n_updates
 
         def do_update_fn(carry):
-            (key, actor_state, critic_state, buffer, n_updates) = carry
+            (key, actor_state, critic_state, buffer, n_updates, saved, offset) = carry
 
             key, subkey = jax.random.split(key)
 
@@ -352,15 +410,25 @@ if __name__ == '__main__':
 
             actor_state, actor_loss = update_actor(actor_state, critic_state, state_b)
 
-            return (key, actor_state, critic_state, buffer, n_updates), (critic_loss, actor_loss, actor_state.params)
+            return (key, actor_state, critic_state, buffer, n_updates, saved, offset), (critic_loss, actor_loss)
 
         def skip_update_fn(carry):
-            key, actor_state, critic_state, buffer, n_updates = carry
-            return carry, (0.0, 0.0, actor_state.params)
+            return carry, (0.0, 0.0)
 
         new_carry, losses = jax.lax.cond(do_update, do_update_fn, skip_update_fn, carry)
+        (key, actor_state, critic_state, buffer, n_updates, saved, offset) = new_carry
 
-        return new_carry, losses
+        # Store the actor params only at the save steps (global update index multiple of SAVE_INT)
+        is_save = do_update & ((offset + step_idx) % SAVE_INT == 0)
+        slot = step_idx // SAVE_INT
+        saved = jax.lax.cond(
+            is_save,
+            lambda sv: jax.tree.map(lambda a, p: a.at[slot].set(p), sv, actor_state.params),
+            lambda sv: sv,
+            saved,
+        )
+
+        return (key, actor_state, critic_state, buffer, n_updates, saved, offset), losses
 
     @partial(jax.jit, static_argnames=("MAX_UPDATES",))
     def run_all_updates_jit(
@@ -369,16 +437,27 @@ if __name__ == '__main__':
         critic_state,
         buffer,
         n_updates,
+        offset,
         MAX_UPDATES,
     ):
-        init = (key, actor_state, critic_state, buffer, n_updates)
+        # Buffer of the actor params to be saved (N_SLOTS copies instead of MAX_UPDATES)
+        saved = jax.tree.map(lambda p: jnp.zeros((N_SLOTS,) + p.shape, p.dtype), actor_state.params)
+
+        init = (key, actor_state, critic_state, buffer, n_updates, saved, offset)
 
         steps = jnp.arange(MAX_UPDATES)
 
-        final_carry, (critic_losses, actor_losses, actor_state_params) = jax.lax.scan(one_update_step, init, steps)
+        final_carry, (critic_losses, actor_losses) = jax.lax.scan(one_update_step, init, steps)
 
-        return final_carry, (critic_losses, actor_losses, actor_state_params)
+        key, actor_state, critic_state, buffer, n_updates, saved, _ = final_carry
+
+        return (key, actor_state, critic_state, buffer, n_updates), (critic_losses, actor_losses), saved
     
+    # End new code
+
+    
+
+
     def one_stdc_update_step(carry, step_idx):
         (key, std_critic_state, critic_state, buffer, n_updates) = carry
 
@@ -446,7 +525,7 @@ if __name__ == '__main__':
 
     # Plot reward function
     if plot_flag:
-        plot_fun.plot_traj_from_ICS_jax(jnp.array(conf.init_states_sim), actor.apply, actor_state.params, sub_name=0, steps=conf.NSTEPS, init=0, psd_delta=1e-4)
+        plot_fun.plot_traj_from_ICS_jax(jnp.array(conf.init_states_sim), actor.apply, actor_state.params, sub_name=0, steps=conf.NSTEPS, init=0, psd_delta=conf.psd_delta)
 
     # Initialize step counter
     update_step_counter = 0
@@ -454,13 +533,14 @@ if __name__ == '__main__':
     # Initialize TO
     start = time.time()
     n_TO_U = conf.EP_UPDATE
-    MAX_UPDATES = max(conf.UPDATE_LOOPS)
+    MAX_UPDATES = int(max(conf.UPDATE_LOOPS))
 
-    TrOpU.TO_System_Solve(jnp.zeros((n_TO_U, conf.nb_state)), jnp.zeros((n_TO_U, conf.NSTEPS, conf.nb_action)), jnp.ones(n_TO_U), maxiter=conf.maxiter, psd_delta=1e-4)
+    # Dummy calls to force JIT compilation before the training loop
+    TrOpU.TO_System_Solve(jnp.zeros((n_TO_U, conf.nb_state)), jnp.zeros((n_TO_U, conf.NSTEPS, conf.nb_action)), jnp.ones(n_TO_U), maxiter=conf.maxiter, psd_delta=conf.psd_delta)
     TrOpU.create_TO_ws(jnp.zeros((n_TO_U, conf.nb_state)), actor.apply, actor_state.params, init=update_step_counter)         
     if BICS_factor > 0:
         n_TO_B = int(n_TO_U*BICS_factor/conf.quant_maxiter)
-        TrOpB.TO_System_Solve(jnp.zeros((n_TO_B, conf.nb_state)), jnp.zeros((n_TO_B, conf.NSTEPS, conf.nb_action)), jnp.ones(n_TO_B), maxiter=conf.maxiter_ws, psd_delta=1e-4)
+        TrOpB.TO_System_Solve(jnp.zeros((n_TO_B, conf.nb_state)), jnp.zeros((n_TO_B, conf.NSTEPS, conf.nb_action)), jnp.ones(n_TO_B), maxiter=conf.maxiter_ws, psd_delta=conf.psd_delta)
         TrOpB.create_TO_ws(jnp.zeros((n_TO_B, conf.nb_state)), actor.apply, actor_state.params, init=1)           
     print('Elapsed time TO init: ', time.time()-start)
 
@@ -472,16 +552,36 @@ if __name__ == '__main__':
         if plot_flag:
             # Plot trajectories with naive warmstart (stabilize controller in conf)
             if ep == 0:
-                plot_fun.plot_traj_from_ICS_jax(jnp.array(conf.init_states_sim), actor.apply, actor_state.params, sub_name=0, steps=conf.NSTEPS, init=0, psd_delta=1e-4) 
+                plot_fun.plot_traj_from_ICS_jax(jnp.array(conf.init_states_sim), actor.apply, actor_state.params, sub_name=0, steps=conf.NSTEPS, init=0, psd_delta=conf.psd_delta) 
 
         # Create random keys
         key, subkey_create_init, subkey_sample_c, subkey_sample_a, subkey_sample_stdc = jax.random.split(key, 5)
+        #NOTE NEW 
+        subkey_BICS, subkey_UICS = jax.random.split(subkey_create_init)
 
         # Create initial states (ICS)
         time_start = time.time()
         if ep > 0 and BICS_factor > 0:
-            init_rand_state, init_rand_t = create_biased_TO_init(n_TO_B, std_critic_state, actor_state, critic_state, subkey_create_init, factor=10)
+            
+            # NOTE: OLD
+            # init_rand_state, init_rand_t = create_biased_TO_init(n_TO_B, std_critic_state, actor_state, critic_state, subkey_create_init, factor=10)
+            # max_iter = conf.maxiter_ws
+
+            # -------------------------- #
+            # NOTE: NEW i do BICS but i addes son random ICS to avoid overfitting and to explore more the state space
+            n_TO_BICS = round(n_TO_B * (1- unif_factor))
+            n_TO_UICS = n_TO_B - n_TO_BICS
+
+            init_state_BICS, init_BICS_t = create_biased_TO_init(n_TO_BICS, std_critic_state, actor_state, critic_state, subkey_BICS, factor=10)
+
+            init_UICS_state, init_UICS_t = create_unif_TO_init(n_TO_UICS, subkey_UICS)
+
+            init_rand_state = jnp.concatenate([init_state_BICS, init_UICS_state], axis=0)
+            init_rand_t = jnp.concatenate([init_BICS_t, init_UICS_t], axis=0)
+
             max_iter = conf.maxiter_ws
+
+            # -------------------------- # 
         else:
             init_rand_state, init_rand_t = create_unif_TO_init(n_TO_U, subkey_create_init)
             max_iter = conf.maxiter
@@ -501,7 +601,7 @@ if __name__ == '__main__':
 
         # Solve the TO problem
         time_start = time.time()
-        TO_states, TO_controls, TO_ee_pos_arr, TO_step_cost, sf, dVdx = TrOp.TO_System_Solve(init_rand_state, init_TO_controls, NSTEPS_SH, maxiter=max_iter, psd_delta=1e-4)
+        TO_states, TO_controls, TO_ee_pos_arr, TO_step_cost, sf, dVdx = TrOp.TO_System_Solve(init_rand_state, init_TO_controls, NSTEPS_SH, maxiter=max_iter, psd_delta=conf.psd_delta)
         print('Solve TO ({:.1f}) : '.format(sum(sf != 0)), time.time()-time_start)
 
         # Postprocess TO data
@@ -530,7 +630,10 @@ if __name__ == '__main__':
             offset = update_step_counter
         else:
             offset = 0
-        (key, actor_state, critic_state, buffer, _), (critic_losses, actor_losses, actor_state_params) = run_all_updates_jit(key, actor_state, critic_state, buffer, n_updates, MAX_UPDATES=MAX_UPDATES)
+        # NOTE OLD: run_all_updates_jit returning all the stacked actor params
+        # (key, actor_state, critic_state, buffer, _), (critic_losses, actor_losses, actor_state_params) = run_all_updates_jit(key, actor_state, critic_state, buffer, n_updates, MAX_UPDATES=MAX_UPDATES)
+        # NOTE NEW: run_all_updates_jit takes also the offset and returns only the actor params stored at the save steps
+        (key, actor_state, critic_state, buffer, _), (critic_losses, actor_losses), saved_params = run_all_updates_jit(key, actor_state, critic_state, buffer, n_updates, offset, MAX_UPDATES=MAX_UPDATES)
         update_step_counter += n_updates
         t_ac = time.time() - t_preup
 
@@ -538,7 +641,10 @@ if __name__ == '__main__':
         for s in range(int(n_updates)):
             if (offset+s) % conf.save_interval == 0:
                 print((offset+s), " : ", t_preup - time_start_init + s*t_ac/n_updates)
-                save_weights(conf.NNs_path, jax.tree.map(lambda x: x[s], actor_state_params), N_try, int(offset+s))
+                # NOTE OLD: params taken from the stacked array at the step s
+                # save_weights(conf.NNs_path, jax.tree.map(lambda x: x[s], actor_state_params), N_try, int(offset+s))
+                # NOTE NEW: params taken from the slot of the save buffer corresponding to the step s
+                save_weights(conf.NNs_path, jax.tree.map(lambda x: x[s // SAVE_INT], saved_params), N_try, int(offset+s))
                 #save_weights(conf.NNs_path,jax.tree_map(lambda x: x[s], actor_state_params), N_try, int(offset+s))
         print('Saving time    : ', time.time()-t_s)
         
@@ -555,7 +661,7 @@ if __name__ == '__main__':
             # Plot rollouts and state and control trajectories
             print("System: {} - N_try = {}".format(system_id, N_try))
             plot_fun.plot_Critic_Value_function(critic.apply, critic_state.params, ep, system_id, name='V')
-            plot_fun.plot_traj_from_ICS_jax(jnp.array(conf.init_states_sim), actor.apply, actor_state.params, sub_name=ep, steps=conf.NSTEPS, maxiter=conf.maxiter, psd_delta=1e-4)
+            plot_fun.plot_traj_from_ICS_jax(jnp.array(conf.init_states_sim), actor.apply, actor_state.params, sub_name=ep, steps=conf.NSTEPS, maxiter=conf.maxiter, psd_delta=conf.psd_delta)
 
         if update_step_counter >= conf.NUPDATES:
             break

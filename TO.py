@@ -3,7 +3,9 @@ import functools
 import jax.numpy as jnp
 from jax import lax
 from jaxadi import convert
-from trajax import optimizers
+# from trajax import optimizers
+#NOTE NEW: i import a modified version of the trajax optimizers 
+import optimizers
 jax.config.update("jax_enable_x64", False)
 
 def wrap_convert(f):
@@ -100,6 +102,28 @@ class TO_JAX:
         """Cost function simulating horizon = T (params)."""
         cost_fn = self.env.cost_func_wrapped if self.conf.tau2u else self.env.cost_tau_func_wrapped # Inverse dynamics used for urdf based systems
         return jnp.where(t <= params, 1, 0)*cost_fn(x,u)
+
+    # NOTE NEW: New function, used to compute dV/dx along the optimal trajectory via backpropagation of costates
+    # Neede becasue ilqr solver does not return dV/dx anymore in the standard version of trajax
+    # def compute_dvdx(self, X, U, T, dyn_fn):
+    #     """dV/dx computed along the optimal trajectory via backpropagation of costates. Shape (N+1, nb_state)."""
+    #     cost = functools.partial(self.cost_func_varT, params=T)
+    #     N = U.shape[0]
+    #     U_pad = jnp.vstack([U, jnp.zeros((1, U.shape[1]))])
+    #     grad_x = jax.grad(cost, argnums=0)
+
+    #     # last costate
+    #     lam_N = grad_x(X[N], U_pad[N], N)
+
+    #     def back_step(lam_next, inp):
+    #         x, u, t = inp
+    #         gx = grad_x(x, u, t)
+    #         _, vjp_fn = jax.vjp(lambda x_: dyn_fn(x_, u), x)
+    #         lam = gx + vjp_fn(lam_next)[0]
+    #         return lam, lam
+
+    #     _, lams = lax.scan(back_step, lam_N, (X[:N], U, jnp.arange(N)), reverse=True)
+    #     return jnp.vstack([lams, lam_N[None, :]])
     
     @functools.partial(jax.jit, static_argnums=(0,4,5))
     def single_optimization(self, x0, U_init, T, maxiter, psd_delta):
@@ -107,6 +131,8 @@ class TO_JAX:
         
         dyn_fn = self.env.dynamics_func_wrapped if self.conf.tau2u else self.env.dynamics_tau_func_wrapped # Inverse dynamics used for urdf based systems
 
+
+        # NOTE: OLD impementation (dones not work unless the ilqr solver is modified to return dV/dx)
         # Run ILQR optimization
         X, U, _, _, _, _, iteration, dvdx, cost_arr = optimizers.ilqr(
             functools.partial(self.cost_func_varT, params=T),
@@ -116,6 +142,30 @@ class TO_JAX:
             maxiter=maxiter,
             psd_delta=psd_delta,
         )
+
+
+
+        # COmmente because now i have the new implementation of the ilqr solver 
+        # NOTE NEW: the ilqr solver giver different outputs in the current version. So i modified the code
+        # Run ILQR optimization
+        # X, U, obj, gradient, adjoints, lqr, iteration = optimizers.ilqr(
+        #     functools.partial(self.cost_func_varT, params=T),
+        #     dyn_fn,
+        #     x0,
+        #     U_init,
+        #     maxiter=maxiter,
+        #     make_psd=True,
+        #     psd_delta=psd_delta,
+        # )
+
+        # # NOTE NEW: Compute cost array for the entire trajectory
+        # timesteps = jnp.arange(X.shape[0])
+        # U_padded = jnp.vstack([U, jnp.zeros((1, U.shape[1]))])
+        # cost_fn = functools.partial(self.cost_func_varT, params=T)
+        # cost_arr = jax.vmap(cost_fn)(X, U_padded, timesteps)
+
+        # # NOTE NEW: obtain the adjoints (dVdx) from the ILQR output
+        # dvdx = self.compute_dvdx(X, U, T, dyn_fn)
         
         # Compute end-effector position trajectory
         p_ee = jax.vmap(self.env.p_ee_jax_wrapped)(X.reshape(-1, self.conf.nb_state, 1))
@@ -135,11 +185,22 @@ class TO_JAX:
             dvdx,
         )
     
-    @functools.partial(jax.jit, static_argnums=(0,4,5))
+    # NOTE LAX: substituted vmap with lax.map to avoid crash due to memory issues
+    # @functools.partial(jax.jit, static_argnums=(0,4,5))
+    # def optimize_batch(self, x0_batch, U_batch, T_batch, maxiter, psd_delta):
+    #     return jax.vmap(lambda x0, U, T: self.single_optimization(x0, U, T, maxiter, psd_delta))(
+    #         x0_batch, U_batch, T_batch
+    #     )
+
+    # NOTE: NEW IMPEMENTATION 
+    @functools.partial(jax.jit, static_argnums=(0, 4, 5))
     def optimize_batch(self, x0_batch, U_batch, T_batch, maxiter, psd_delta):
-        return jax.vmap(lambda x0, U, T: self.single_optimization(x0, U, T, maxiter, psd_delta))(
-            x0_batch, U_batch, T_batch
+        return jax.lax.map(
+            lambda args: self.single_optimization(*args, maxiter, psd_delta),
+            (x0_batch, U_batch, T_batch),
+            batch_size=self.conf.MAP_BATCH_SIZE_TO,
         )
+
     
     def TO_System_Solve(self, x0_batch, U_batch, T_batch, maxiter=1000, psd_delta=1e-3):
         return self.optimize_batch(x0_batch, U_batch, T_batch, maxiter, psd_delta)

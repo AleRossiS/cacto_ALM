@@ -5,9 +5,11 @@ import jax.numpy as jnp
 import pinocchio.casadi as cpin
 from jaxadi import convert
 
+from jaxadi._expand import translate as expand_translate   # NOTE NEW
+
 def wrap_convert(f):
     """Convert a CasADi function into a JAX-compatible and JIT-compiled function."""
-    f_converted = convert(f)
+    f_converted = convert(f, translate=expand_translate)   # NOTE NEW: was convert(f) 
     f_jitted = jax.jit(f_converted)
 
     @jax.jit

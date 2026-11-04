@@ -3,16 +3,16 @@ import numpy as np
 system_id = 'single_integrator'
 
 ''' CACTO parameters '''
-NUPDATES = 25001 - 1                                                           # Max NNs updates
-UPDATE_LOOPS = np.clip(np.arange(1000, 500000, 3000), 0, 1.5e4)                # Number of updates of both critic and actor performed every EP_UPDATE episodes                                                                           
-EP_UPDATE = 200                                                                # Number of episodes before updating critic and actor
+NUPDATES = 25000 * 8                                                          # Max NNs updates
+UPDATE_LOOPS = np.clip(np.arange(2000, 100000, 1000), 0, 1.5e4)  # NOTE: was np.clip(np.arange(1000, 500000, 3000), 0, 1.5e4)                # Number of updates of both critic and actor performed every EP_UPDATE episodes                                                                           
+EP_UPDATE =  300 #200                                                                # Number of episodes before updating critic and actor
 NLOOPS = len(UPDATE_LOOPS)                                                     # Number of algorithm loops
 NSTEPS = 100                                                                   # Max episode length
 CRITIC_LEARNING_RATE = 5e-4                                                    # Learning rate for the critic network
 STD_CRITIC_LEARNING_RATE = 2*CRITIC_LEARNING_RATE                              # Learning rate for the std-critic network
 ACTOR_LEARNING_RATE = 1e-3                                                     # Learning rate for the policy network
 REPLAY_SIZE = 2**16                                                            # Size of the replay buffer
-BATCH_SIZE = 2048                                                              # Size of the mini-batch 
+BATCH_SIZE =  512*2 # NOTE: was 2048                                                              # Size of the mini-batch 
 
 # Set _steps_TD_N ONLY if MC not used
 MC = 0
@@ -27,13 +27,13 @@ if not MC:
 ### Savings parameters
 save_flag = 1
 if save_flag:
-    save_interval =  5000                                                      # Save NNs interval
+    save_interval = 5000 #5000                                                      # Save NNs interval
 else:
     save_interval = np.inf                                                     # Save NNs interval
 
 plot_flag = 1
 if plot_flag:
-    plot_rollout_interval_diff_loc = 6000                                      # plot.rollout() interval - diff_loc (# update)
+    plot_rollout_interval_diff_loc = 1000 #6000                                      # plot.rollout() interval - diff_loc (# update)
 else:
     plot_rollout_interval_diff_loc = np.inf                                    # plot.rollout() interval - diff_loc (# update)
 
@@ -81,8 +81,20 @@ x_des = -7.0                                                                    
 y_des = 0.0                                                                                                 # Target y position
 TARGET_STATE = np.array([x_des,y_des])                                                                      # Target position
 
-maxiter = 200                                                                                               # Max TO iterations
-max_cost = 1e3                                                                                              # Max TO cost 
+maxiter = 100# NOTE: was 200                                                                             # Max TO iterations
+max_cost = 1e3# NOTE: was 1e3                                                                             # Max TO cost 
+
+
+
+
+
+# NOTE: ADEED PARAMS 
+maxiter_ws = 50 # NOTE: was 50                                                                                              # Max TO iterations - CACTO warm-start
+quant_maxiter = 1 # NOTE: was 1
+
+psd_delta = 1e-4                                                                                                 # PSD matrix regularization factor
+
+
 
 
 
@@ -105,8 +117,8 @@ na = 2
 
 
 ### Dynamics parameters
-dt = 0.05                                                                                                   # Timestep   
-
+dt = 0.1 #0.05                                                                                                   # Timestep 
+ 
 simulate_coulomb_friction = 0                                                                               # To simulate friction
 simulation_type = 'euler'                                                                                   # Either 'timestepping' or 'euler'
 tau_coulomb_max = 0*np.ones(na)                                                                             # Expressed as percentage of torque max
@@ -156,7 +168,7 @@ supervise_learn_flag = 0                                                        
 
 ### NNs parameters
 features_critic = [64, 64, 128, 128, 1]                                                                     # Features critic and std-critic networks
-features_actor = [256, 256, nb_action]                                                                      # Features actor network
+features_actor = [256, 256, 256, nb_action] # NOTE: was [256, 256, nb_action]                     # Features actor network
 
 NORMALIZE_INPUTS = 1                                                                                        # Flag to normalize inputs (state)
 
@@ -167,3 +179,6 @@ remapped_indices = None
 
 tau2u = 0
 nb_MPC_step = 1
+
+# NOTE NEW: Added for lax.map() function
+MAP_BATCH_SIZE_TO = 10                                                                                          # Batch size for lax.map() function
