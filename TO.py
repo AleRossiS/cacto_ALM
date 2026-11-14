@@ -103,27 +103,6 @@ class TO_JAX:
         cost_fn = self.env.cost_func_wrapped if self.conf.tau2u else self.env.cost_tau_func_wrapped # Inverse dynamics used for urdf based systems
         return jnp.where(t <= params, 1, 0)*cost_fn(x,u)
 
-    # NOTE NEW: New function, used to compute dV/dx along the optimal trajectory via backpropagation of costates
-    # Neede becasue ilqr solver does not return dV/dx anymore in the standard version of trajax
-    # def compute_dvdx(self, X, U, T, dyn_fn):
-    #     """dV/dx computed along the optimal trajectory via backpropagation of costates. Shape (N+1, nb_state)."""
-    #     cost = functools.partial(self.cost_func_varT, params=T)
-    #     N = U.shape[0]
-    #     U_pad = jnp.vstack([U, jnp.zeros((1, U.shape[1]))])
-    #     grad_x = jax.grad(cost, argnums=0)
-
-    #     # last costate
-    #     lam_N = grad_x(X[N], U_pad[N], N)
-
-    #     def back_step(lam_next, inp):
-    #         x, u, t = inp
-    #         gx = grad_x(x, u, t)
-    #         _, vjp_fn = jax.vjp(lambda x_: dyn_fn(x_, u), x)
-    #         lam = gx + vjp_fn(lam_next)[0]
-    #         return lam, lam
-
-    #     _, lams = lax.scan(back_step, lam_N, (X[:N], U, jnp.arange(N)), reverse=True)
-    #     return jnp.vstack([lams, lam_N[None, :]])
     
     @functools.partial(jax.jit, static_argnums=(0,4,5))
     def single_optimization(self, x0, U_init, T, maxiter, psd_delta):
@@ -132,49 +111,51 @@ class TO_JAX:
         dyn_fn = self.env.dynamics_func_wrapped if self.conf.tau2u else self.env.dynamics_tau_func_wrapped # Inverse dynamics used for urdf based systems
 
 
-        # NOTE: OLD impementation (dones not work unless the ilqr solver is modified to return dV/dx)
-        # Run ILQR optimization
-        X, U, _, _, _, _, iteration, dvdx, cost_arr = optimizers.ilqr(
-            functools.partial(self.cost_func_varT, params=T),
-            dyn_fn,
-            x0,
-            U_init,
-            maxiter=maxiter,
-            psd_delta=psd_delta,
-        )
+        # NOTE NEW: Check if ALM-TO is enabled in the configuration. If so, use constrained iLQR; otherwise, use unconstrained iLQR.
+        if self.conf.CACTO_ALM:
+            # ALM-TO: constrained iLQR, obstacles as hard constraints
+            X, U, _, _, _, _, _, max_viol, _, _, iteration, _, dvdx, cost_arr = optimizers.constrained_ilqr(
+                    functools.partial(self.cost_func_varT, params=T),
+                    dyn_fn,
+                    x0,
+                    U_init,
+                    inequality_constraint=lambda x, u, t: self.env.constraint_func_wrapped(x),
+                    maxiter_al=self.conf.maxiter_al,
+                    maxiter_ilqr=maxiter,
+                    constraints_threshold=self.conf.constraints_threshold,
+                    penalty_init=self.conf.penalty_init,
+                    penalty_update_rate=self.conf.penalty_update_rate,
+                    psd_delta=psd_delta,
+                )
 
+        else:
+            # Original CACTO: unconstrained iLQR, obstacles as soft penalties in the cost
+            X, U, _, _, _, _, iteration, dvdx, cost_arr = optimizers.ilqr(
+                functools.partial(self.cost_func_varT, params=T),
+                dyn_fn,
+                x0,
+                U_init,
+                maxiter=maxiter,
+                psd_delta=psd_delta,
+            )
+    
 
-
-        # COmmente because now i have the new implementation of the ilqr solver 
-        # NOTE NEW: the ilqr solver giver different outputs in the current version. So i modified the code
-        # Run ILQR optimization
-        # X, U, obj, gradient, adjoints, lqr, iteration = optimizers.ilqr(
-        #     functools.partial(self.cost_func_varT, params=T),
-        #     dyn_fn,
-        #     x0,
-        #     U_init,
-        #     maxiter=maxiter,
-        #     make_psd=True,
-        #     psd_delta=psd_delta,
-        # )
-
-        # # NOTE NEW: Compute cost array for the entire trajectory
-        # timesteps = jnp.arange(X.shape[0])
-        # U_padded = jnp.vstack([U, jnp.zeros((1, U.shape[1]))])
-        # cost_fn = functools.partial(self.cost_func_varT, params=T)
-        # cost_arr = jax.vmap(cost_fn)(X, U_padded, timesteps)
-
-        # # NOTE NEW: obtain the adjoints (dVdx) from the ILQR output
-        # dvdx = self.compute_dvdx(X, U, T, dyn_fn)
-        
         # Compute end-effector position trajectory
         p_ee = jax.vmap(self.env.p_ee_jax_wrapped)(X.reshape(-1, self.conf.nb_state, 1))
         
-        # Define success based on cost threshold and iteration limit
+        # NOTE NEW: Check if ALM-TO is enabled in the configuration.
+        # If so the success flag is determined by both the cost and the maximum constraint violation; otherwise, it is determined solely by the cost.
         if self.conf.system_id == 'aliengo':
             success_flag = (jnp.sum(cost_arr[:-1]) < self.conf.max_cost) & (iteration < maxiter)# & (1 - jnp.any(jax.vmap(inequality_constraint)(X[:-1], U, X[:-1])>1e-3))
+        elif self.conf.CACTO_ALM:
+            success_flag = (jnp.sum(cost_arr) < self.conf.max_cost) & (max_viol < self.conf.constraints_threshold)
         else:
-            success_flag = (jnp.sum(cost_arr) < self.conf.max_cost) & (iteration < maxiter)
+            # NOTE OLD
+            # success_flag = (jnp.sum(cost_arr) < self.conf.max_cost) & (iteration < maxiter)
+
+            # NOTE NEW: i removed the iteration check
+             success_flag = (jnp.sum(cost_arr) < self.conf.max_cost) 
+
 
         return (
             X,
@@ -185,14 +166,7 @@ class TO_JAX:
             dvdx,
         )
     
-    # NOTE LAX: substituted vmap with lax.map to avoid crash due to memory issues
-    # @functools.partial(jax.jit, static_argnums=(0,4,5))
-    # def optimize_batch(self, x0_batch, U_batch, T_batch, maxiter, psd_delta):
-    #     return jax.vmap(lambda x0, U, T: self.single_optimization(x0, U, T, maxiter, psd_delta))(
-    #         x0_batch, U_batch, T_batch
-    #     )
-
-    # NOTE: NEW IMPEMENTATION 
+    # NOTE: NEW IMPEMENTATION LAX: substituted vmap with lax.map to avoid crash due to memory issues
     @functools.partial(jax.jit, static_argnums=(0, 4, 5))
     def optimize_batch(self, x0_batch, U_batch, T_batch, maxiter, psd_delta):
         return jax.lax.map(

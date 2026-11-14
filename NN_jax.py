@@ -175,6 +175,18 @@ class CriticSineMLP(nn.Module):
 
         return x
 
+
+
+# NOTE NEW: Function to perform Gradient Clipping on the gradients of the actor and critic networks
+def make_optimizer(learning_rate, weight_decay, max_grad_norm=None):
+    """AdamW optimizer, preceded by gradient clipping by global norm if max_grad_norm is not None."""
+    adamw = optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay)
+    if max_grad_norm is None:
+        return adamw
+    return optax.chain(optax.clip_by_global_norm(max_grad_norm), adamw)
+
+
+
 def create_networks(conf, seed=0):
     """Create and initialize the Actor, Critic, and STD-Critic networks."""
     key1, key_actor, key_critic, key_std_critic = jax.random.split(jax.random.PRNGKey(seed), 4)
@@ -186,18 +198,37 @@ def create_networks(conf, seed=0):
     std_critic = CriticSineMLP(conf)
 
     # Initialize training states
+    # NOTE OLD code
+    # actor_state = TrainStateA.create(
+    #     apply_fn=actor.apply,
+    #     params=actor.init(key_actor, x_dummy),
+    #     prev_params=actor.init(key_actor, x_dummy),
+    #     tx=optax.adamw(learning_rate=conf.ACTOR_LEARNING_RATE, weight_decay=conf.areg),
+    #     )
+    
+    # critic_state = TrainStateC.create(
+    #     apply_fn=critic.apply,
+    #     params=critic.init(key_critic, x_dummy),
+    #     target_params=critic.init(key_critic, x_dummy),
+    #     tx=optax.adamw(learning_rate=conf.CRITIC_LEARNING_RATE, weight_decay=conf.creg), 
+    #     )
+    
+
+    # NOTE NEW code: AdamW optimizer with optional gradient clipping
     actor_state = TrainStateA.create(
         apply_fn=actor.apply,
         params=actor.init(key_actor, x_dummy),
         prev_params=actor.init(key_actor, x_dummy),
-        tx=optax.adamw(learning_rate=conf.ACTOR_LEARNING_RATE, weight_decay=conf.areg),
+        # NOTE NEW: AdamW with optional gradient clipping
+        tx=make_optimizer(conf.ACTOR_LEARNING_RATE, conf.areg, getattr(conf, 'ACTOR_GRAD_CLIP', None)),
         )
     
     critic_state = TrainStateC.create(
         apply_fn=critic.apply,
         params=critic.init(key_critic, x_dummy),
         target_params=critic.init(key_critic, x_dummy),
-        tx=optax.adamw(learning_rate=conf.CRITIC_LEARNING_RATE, weight_decay=conf.creg), 
+        # NOTE NEW: AdamW with optional gradient clipping
+        tx=make_optimizer(conf.CRITIC_LEARNING_RATE, conf.creg, getattr(conf, 'CRITIC_GRAD_CLIP', None)),
         )
     
     std_critic_state = TrainState.create(

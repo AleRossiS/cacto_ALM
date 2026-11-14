@@ -7,6 +7,7 @@ os.environ['XLA_FLAGS'] = (
 )
 import sys
 import time
+import shlex
 import shutil
 import random
 import argparse
@@ -23,6 +24,23 @@ from replay_buffer import init_buffer, buffer_add, buffer_sample
 from NN_jax import create_networks, save_weights, custom_log, TrainStateC, TrainStateA
 
 jax.config.update("jax_enable_x64", False)
+
+# NOTE NEW: Tee class to log stdout and stderr to a file
+class Tee:
+    """Write everything printed on the terminal also to a log file."""  
+    def __init__(self, stream, log_file):
+        self.stream = stream          # original terminal stream (sys.stdout or sys.stderr)
+        self.log_file = log_file
+
+    def write(self, message):
+        self.stream.write(message)
+        self.log_file.write(message)
+        self.log_file.flush()         # write to disk immediately, so the log is complete even if the run crashes
+
+    def flush(self):
+        self.stream.flush()
+        self.log_file.flush()
+
 
 def parse_args():
     ''' Parse the arguments for CACTO training '''
@@ -116,6 +134,16 @@ if __name__ == '__main__':
     for path in conf.path_list:
         os.makedirs(path + '/N_try_{}'.format(N_try), exist_ok=True)
     os.makedirs(conf.Config_path, exist_ok=True)
+
+    # NOTE NEW: copy everything printed on the terminal (and the error messages) to Log/N_try_N/terminal_log.txt
+    log_file = open(conf.Log_path + 'N_try_{}/terminal_log.txt'.format(N_try), 'w')
+    sys.stdout = Tee(sys.stdout, log_file)
+    sys.stderr = Tee(sys.stderr, log_file)
+
+    # NOTE NEW: write the command used to launch the run and the resulting arguments at the top of the log
+    print('Command: python3 ' + ' '.join(shlex.quote(a) for a in sys.argv))
+    print('Arguments: {}'.format(args))
+    print('Seed used: {}'.format(seed))
 
     # Save configuration
     params = [p for p in conf.__dict__ if not p.startswith("__")]
@@ -219,11 +247,14 @@ if __name__ == '__main__':
 
         return std_critic_state, std_critic_loss_value
     
+    # NOTE NEW: Modified actor update to include ALM terms in the loss function (if CACTO_ALM is enabled)
     @jax.jit
     def update_actor(
         actor_state: TrainStateA,
         critic_state: TrainStateC,
         observations: jnp.ndarray,
+        alm_lambda: jnp.ndarray,        # NOTE NEW: Lagrange multipliers, one per obstacle, shape (n_constraints,)
+        alm_rho: float,                 # NOTE NEW: AL penalty
         ):
         """Update the actor network parameters."""
         
@@ -231,24 +262,44 @@ if __name__ == '__main__':
         actor_state = actor_state.replace(prev_params=actor_state.params)
 
         # Discrete time update
-        tau = actor.apply(actor_state.params, observations)
+        tau = actor.apply(actor_state.params, observations) # controls predicted by the actor
         state_next = jax.vmap(env_TO.dynamics_tau_func_wrapped)(observations, tau)
         dcritic_dstate_next = jax.vmap(jax.grad(lambda s: critic.apply(critic_state.params, s).squeeze()))(state_next)[:, None, :]
+        
+        # NOTE OLD
         ddyn_da = jax.vmap(jax.jacrev(env_TO.dynamics_tau_func_wrapped, argnums=1))(observations, tau)/conf.state_norm_arr[:,None]
+
+        # NOTE NEW: remove normalization of the dynamics Jacobian by state_norm_arr
+        # ddyn_da = jax.vmap(jax.jacrev(env_TO.dynamics_tau_func_wrapped, argnums=1))(observations, tau)
+        
         dcritic_da = (dcritic_dstate_next @ ddyn_da).squeeze()[:, None, :]
 
         def actor_loss(params):
             # Compute actor loss
             tau = actor.apply(params, observations)
-            return ((dcritic_da @ tau[:, :, None]).squeeze() + jax.vmap(env_TO.cost_tau_func_wrapped)(observations, tau).squeeze()).mean()
+            loss = (dcritic_da @ tau[:, :, None]).squeeze() + jax.vmap(env_TO.cost_tau_func_wrapped)(observations, tau).squeeze()
+
+            if conf.CACTO_ALM:
+                # NOTE NEW: AL terms
+                state_next = jax.vmap(env_TO.dynamics_tau_func_wrapped)(observations, tau)
+                g = jnp.maximum(0.0, jax.vmap(env_TO.constraint_func_wrapped)(state_next)) # violation
+
+                loss = loss + g @ alm_lambda + 0.5 * alm_rho * jnp.sum(g*g, axis=1) # ALM loss term
+                g_mean = jnp.mean(g, axis=0) # mean violation per constraint
+            
+            else:
+                g_mean = jnp.zeros_like(alm_lambda) # placeholder for mean violation per constraint (same shape as the multipliers)
+ 
+            return loss.mean(), g_mean 
+
         
         # Compute loss and gradients
-        actor_loss_value, grads = jax.value_and_grad(actor_loss)(actor_state.params)
+        (actor_loss_value, g_mean), grads = jax.value_and_grad(actor_loss, has_aux=True)(actor_state.params)
 
         # Apply gradient update
         actor_state = actor_state.apply_gradients(grads=grads)
 
-        return actor_state, actor_loss_value
+        return actor_state, actor_loss_value, g_mean 
     
     jax.jit
     def sample_ICS(n, key):
@@ -311,7 +362,25 @@ if __name__ == '__main__':
         # Create uniformly distributed initial conditions (ICS)
         init_rand_state_t, init_rand_t = sample_ICS(n_UICS, key)
 
-        return init_rand_state_t, init_rand_t
+        mask_unfeas = jax.vmap(env_TO.check_feasible_wrapped)(init_rand_state_t) != 1
+
+        feasible_init_state = init_rand_state_t[~mask_unfeas]
+        feasible_init_t = init_rand_t[~mask_unfeas]
+
+        # Resample if not enough feasible ICS are found
+        while feasible_init_state.shape[0] < n_UICS:
+            key, subkey = jax.random.split(key)
+            init_rand_state_t, init_rand_t = sample_ICS(n_UICS, subkey)
+
+            mask_unfeas = jax.vmap(env_TO.check_feasible_wrapped)(init_rand_state_t) != 1
+
+            feasible_init_state_new = init_rand_state_t[~mask_unfeas]
+            feasible_init_t_new = init_rand_t[~mask_unfeas]
+
+            feasible_init_state = jnp.concatenate([feasible_init_state, feasible_init_state_new], axis=0)
+            feasible_init_t = jnp.concatenate([feasible_init_t, feasible_init_t_new], axis=0)
+
+        return feasible_init_state[:n_UICS], feasible_init_t[:n_UICS]
     
     @jax.jit
     def evaluate_ics(init_rand_state_t, std_critic_state, actor_state, critic_state):
@@ -392,13 +461,18 @@ if __name__ == '__main__':
     N_SLOTS = int(max(conf.UPDATE_LOOPS)) // SAVE_INT + 1                                      # Max number of saves in a single call of run_all_updates_jit
 
     def one_update_step(carry, step_idx):
-        (key, actor_state, critic_state, buffer, n_updates, saved, offset) = carry
+        """One update step: sample a minibatch, update critic and actor, and (if CACTO_ALM) update lambda and rho."""
+
+        # NOTE NEW: carry now includes the ALM multipliers and penalty
+        (key, actor_state, critic_state, buffer, n_updates, saved, offset, alm_lambda, alm_rho) = carry 
 
         # Mask: whether this step is active
         do_update = step_idx < n_updates
 
         def do_update_fn(carry):
-            (key, actor_state, critic_state, buffer, n_updates, saved, offset) = carry
+
+            # NOTE NEW: carry now includes the ALM multipliers and penalty
+            (key, actor_state, critic_state, buffer, n_updates, saved, offset, alm_lambda, alm_rho) = carry
 
             key, subkey = jax.random.split(key)
 
@@ -408,15 +482,23 @@ if __name__ == '__main__':
 
             critic_state, critic_loss = update_critic( critic_state, state_b, state_next_b, rtg_b, dVdx_b, d_b)
 
-            actor_state, actor_loss = update_actor(actor_state, critic_state, state_b)
+            # NOTE NEW: the actor receives the current lambda and rho and returns the mean violation of the minibatch
+            actor_state, actor_loss, g_mean = update_actor(actor_state, critic_state, state_b, alm_lambda, alm_rho)
 
-            return (key, actor_state, critic_state, buffer, n_updates, saved, offset), (critic_loss, actor_loss)
+            if conf.CACTO_ALM:
+                # NOTE NEW: dual update after every minibatch (projected ascent on lambda, penalty growth on rho)
+                alm_lambda = jnp.clip(alm_lambda + conf.eta_lambda * alm_rho * g_mean, 0.0, conf.lambda_max)
+                alm_rho = jnp.where(jnp.max(g_mean) > conf.viol_tol,
+                                    jnp.minimum(conf.rho_growth * alm_rho, conf.rho_max),
+                                    alm_rho)
+
+            return (key, actor_state, critic_state, buffer, n_updates, saved, offset,alm_lambda, alm_rho), (critic_loss, actor_loss) # NOTE NEW returnoign alm_lambda and alm_rho in the carry
 
         def skip_update_fn(carry):
             return carry, (0.0, 0.0)
 
         new_carry, losses = jax.lax.cond(do_update, do_update_fn, skip_update_fn, carry)
-        (key, actor_state, critic_state, buffer, n_updates, saved, offset) = new_carry
+        (key, actor_state, critic_state, buffer, n_updates, saved, offset, alm_lambda, alm_rho) = new_carry # NOTE NEW: returning alm_lambda and alm_rho in the carry
 
         # Store the actor params only at the save steps (global update index multiple of SAVE_INT)
         is_save = do_update & ((offset + step_idx) % SAVE_INT == 0)
@@ -428,7 +510,8 @@ if __name__ == '__main__':
             saved,
         )
 
-        return (key, actor_state, critic_state, buffer, n_updates, saved, offset), losses
+        # NOTE NEW: return the updated ALM multipliers and penalty
+        return (key, actor_state, critic_state, buffer, n_updates, saved, offset, alm_lambda, alm_rho), losses
 
     @partial(jax.jit, static_argnames=("MAX_UPDATES",))
     def run_all_updates_jit(
@@ -438,20 +521,24 @@ if __name__ == '__main__':
         buffer,
         n_updates,
         offset,
+        alm_lambda,        # NOTE NEW
+        alm_rho,           # NOTE NEW
         MAX_UPDATES,
     ):
+        """Run all the updates of one CACTO cycle in a single compiled scan."""
         # Buffer of the actor params to be saved (N_SLOTS copies instead of MAX_UPDATES)
         saved = jax.tree.map(lambda p: jnp.zeros((N_SLOTS,) + p.shape, p.dtype), actor_state.params)
 
-        init = (key, actor_state, critic_state, buffer, n_updates, saved, offset)
+        init = (key, actor_state, critic_state, buffer, n_updates, saved, offset, alm_lambda, alm_rho)
 
         steps = jnp.arange(MAX_UPDATES)
 
         final_carry, (critic_losses, actor_losses) = jax.lax.scan(one_update_step, init, steps)
 
-        key, actor_state, critic_state, buffer, n_updates, saved, _ = final_carry
+        key, actor_state, critic_state, buffer, n_updates, saved, _, alm_lambda, alm_rho = final_carry # NOTE NEW: returning alm_lambda and alm_rho in the carry
 
-        return (key, actor_state, critic_state, buffer, n_updates), (critic_losses, actor_losses), saved
+        # NOTE NEW: lambda and rho returned so that they persist to the next CACTO cycle
+        return (key, actor_state, critic_state, buffer, n_updates, alm_lambda, alm_rho), (critic_losses, actor_losses), saved
     
     # End new code
 
@@ -529,6 +616,17 @@ if __name__ == '__main__':
 
     # Initialize step counter
     update_step_counter = 0
+
+    # NOTE NEW: Initialize Lagrange multipliers and penalty for ALM (if CACTO_ALM is enabled)
+    if conf.CACTO_ALM:
+        # Initialize Lagrange multipliers and penalty for ALM
+        n_constraints = env_TO.constraint_func_wrapped(jnp.zeros(conf.nb_state)).shape[0] 
+        alm_lambda = jnp.full((n_constraints,), conf.lambda_init)
+        alm_rho = jnp.array(conf.rho_init)
+    else: 
+        # Placeholder values for Lagrange multipliers and penalty (not used if CACTO_ALM is disabled)
+        alm_lambda = jnp.zeros((1,))
+        alm_rho = jnp.array(0.0)
 
     # Initialize TO
     start = time.time()
@@ -630,12 +728,19 @@ if __name__ == '__main__':
             offset = update_step_counter
         else:
             offset = 0
+        
         # NOTE OLD: run_all_updates_jit returning all the stacked actor params
         # (key, actor_state, critic_state, buffer, _), (critic_losses, actor_losses, actor_state_params) = run_all_updates_jit(key, actor_state, critic_state, buffer, n_updates, MAX_UPDATES=MAX_UPDATES)
+        
         # NOTE NEW: run_all_updates_jit takes also the offset and returns only the actor params stored at the save steps
-        (key, actor_state, critic_state, buffer, _), (critic_losses, actor_losses), saved_params = run_all_updates_jit(key, actor_state, critic_state, buffer, n_updates, offset, MAX_UPDATES=MAX_UPDATES)
+        # I also added the alm_lambda and alm_rho to the carry and return values
+        (key, actor_state, critic_state, buffer, _, alm_lambda, alm_rho), (critic_losses, actor_losses), saved_params = run_all_updates_jit(
+            key, actor_state, critic_state, buffer, n_updates, offset, alm_lambda, alm_rho, MAX_UPDATES=MAX_UPDATES)
         update_step_counter += n_updates
         t_ac = time.time() - t_preup
+
+        if conf.CACTO_ALM:
+            print('ALM -> lambda:', alm_lambda, ' rho:', float(alm_rho))   # NOTE NEW
 
         t_s = time.time()
         for s in range(int(n_updates)):

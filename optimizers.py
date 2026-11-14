@@ -1343,7 +1343,11 @@ def constrained_ilqr(cost,
 
   def body(inputs):
     # unpack
-    _, U, dual_equality, dual_inequality, penalty, equality_constraints, inequality_constraints, _, _, _, iteration_ilqr, iteration_al = inputs
+    # NOTE OLD
+    # _, U, dual_equality, dual_inequality, penalty, equality_constraints, inequality_constraints, _, _, _, iteration_ilqr, iteration_al = inputs
+
+    # NOTE NEW: 2 more elements at the end of the carry (p, cost_arr)
+    _, U, dual_equality, dual_inequality, penalty, equality_constraints, inequality_constraints, _, _, _, iteration_ilqr, iteration_al, _, _ = inputs
 
     # augmented Lagrangian parameters
     al_args = {
@@ -1352,21 +1356,41 @@ def constrained_ilqr(cost,
         'penalty': penalty,
     }
 
-    # solve iLQR problem
-    X, U, obj, gradient, _, _, iteration = ilqr(
-        partial(augmented_lagrangian, **al_args),
-        dynamics,
-        x0,
-        U,
-        grad_norm_threshold=grad_norm_threshold,
-        relative_grad_norm_threshold=relative_grad_norm_threshold,
-        obj_step_threshold=obj_step_threshold,
-        inputs_step_threshold=inputs_step_threshold,
-        make_psd=make_psd,
-        psd_delta=psd_delta,
-        alpha_0=alpha_0,
-        alpha_min=alpha_min,
-        maxiter=maxiter_ilqr)
+    # NOTE OLD
+    # # solve iLQR problem
+    # X, U, obj, gradient, _, _, iteration = ilqr(
+    #     partial(augmented_lagrangian, **al_args),
+    #     dynamics,
+    #     x0,
+    #     U,
+    #     grad_norm_threshold=grad_norm_threshold,
+    #     relative_grad_norm_threshold=relative_grad_norm_threshold,
+    #     obj_step_threshold=obj_step_threshold,
+    #     inputs_step_threshold=inputs_step_threshold,
+    #     make_psd=make_psd,
+    #     psd_delta=psd_delta,
+    #     alpha_0=alpha_0,
+    #     alpha_min=alpha_min,
+    #     maxiter=maxiter_ilqr)
+
+
+
+    # NOTE NEW: the custom ilqr returns 9 outputs. p (dV/dx) is kept; the last one (cost_arr) is discarded
+    #           because it is the AUGMENTED cost, not the original one
+    X, U, obj, gradient, _, _, iteration, p, _ = ilqr(
+      partial(augmented_lagrangian, **al_args),
+      dynamics,
+      x0,
+      U,
+      grad_norm_threshold=grad_norm_threshold,
+      relative_grad_norm_threshold=relative_grad_norm_threshold,
+      obj_step_threshold=obj_step_threshold,
+      inputs_step_threshold=inputs_step_threshold,
+      make_psd=make_psd,
+      psd_delta=psd_delta,
+      alpha_0=alpha_0,
+      alpha_min=alpha_min,
+      maxiter=maxiter_ilqr)
 
     # evalute constraints
     U_pad = pad(U)
@@ -1374,6 +1398,10 @@ def constrained_ilqr(cost,
     equality_constraints = equality_constraint_mapped(X, U_pad, t_range)
 
     inequality_constraints = inequality_constraint_mapped(X, U_pad, t_range)
+
+    # NOTE NEW: per-step ORIGINAL cost (without AL terms) along the new trajectory, as in the custom ilqr
+    cost_arr = vectorize(cost)(X, U_pad, t_range)
+
     inequality_constraints_projected = inequality_projection(
         inequality_constraints)
 
@@ -1395,7 +1423,11 @@ def constrained_ilqr(cost,
     iteration_ilqr += iteration
     iteration_al += 1
 
-    return X, U, dual_equality, dual_inequality, penalty, equality_constraints, inequality_constraints, max_constraint_violation, obj, gradient, iteration_ilqr, iteration_al
+    # NOTE OLD
+    # return X, U, dual_equality, dual_inequality, penalty, equality_constraints, inequality_constraints, max_constraint_violation, obj, gradient, iteration_ilqr, iteration_al
+
+    # NOTE NEW: p and cost_arr added at the END of the carry, so the indices read in continuation_criteria stay valid
+    return X, U, dual_equality, dual_inequality, penalty, equality_constraints, inequality_constraints, max_constraint_violation, obj, gradient, iteration_ilqr, iteration_al, p, cost_arr
 
   def continuation_criteria(inputs):
     # unpack
@@ -1411,8 +1443,16 @@ def constrained_ilqr(cost,
                               max_constraint_violation > constraints_threshold,
                               max_complementary_slack > constraints_threshold))
 
+  # NOTE OLD
+  # return lax.while_loop(
+  #     continuation_criteria, body,
+  #     (X, U, dual_equality, dual_inequality, penalty,
+  #      equality_constraints, inequality_constraints, np.inf, np.inf,
+  #      np.full(U.shape, np.inf), 0, 0))
+
   return lax.while_loop(
-      continuation_criteria, body,
-      (X, U, dual_equality, dual_inequality, penalty,
-       equality_constraints, inequality_constraints, np.inf, np.inf,
-       np.full(U.shape, np.inf), 0, 0))
+        continuation_criteria, body,
+        (X, U, dual_equality, dual_inequality, penalty,
+        equality_constraints, inequality_constraints, np.inf, np.inf,
+        np.full(U.shape, np.inf), 0, 0,
+       X, np.zeros(horizon)))   # NOTE NEW: initial placeholders for p (shape (T+1, n)) and cost_arr (shape (T+1,))

@@ -307,11 +307,21 @@ class PLOT():
         for j in range(len(init_state)):
             ax1.scatter(ee_pos_RL[j, 0, 0], ee_pos_RL[j, 0, 1], color=colorss[j], label=f'Start {j}')
             ax1.plot(ee_pos_RL[j, :, 0], ee_pos_RL[j, :, 1], '--', color=colorss[j])
-            ax2.scatter(ee_pos_TO[j, 0, 0], ee_pos_TO[j, 0, 1], color=colorss[j])
-            ax2.plot(ee_pos_TO[j, :, 0], ee_pos_TO[j, :, 1], color=colorss[j])
+            if sf[j]:
+                # Successful TO: initial state + optimal trajectory
+                ax2.scatter(ee_pos_TO[j, 0, 0], ee_pos_TO[j, 0, 1], color=colorss[j])
+                ax2.plot(ee_pos_TO[j, :, 0], ee_pos_TO[j, :, 1], color=colorss[j])
+            else:
+                # NOTE NEW: failed TO -> 'x' on the TRUE initial state (before, the -1 placeholder was drawn as a dot at (-1, -1))
+                ax2.scatter(ee_pos_RL[j, 0, 0], ee_pos_RL[j, 0, 1], color=colorss[j], marker='x', s=100)
         
         ax1.plot([self.conf.TARGET_STATE[0]],[self.conf.TARGET_STATE[1]],'b*',markersize=5) 
-        ax2.plot([self.conf.TARGET_STATE[0]],[self.conf.TARGET_STATE[1]],'b*',markersize=5) 
+        ax2.plot([self.conf.TARGET_STATE[0]],[self.conf.TARGET_STATE[1]],'b*',markersize=5)
+
+        # NOTE NEW: number of failed TO problems in the TO panel
+        n_fail = int(np.sum(sf == 0))
+        ax2.text(0.98, 0.02, f"TO failed: {n_fail}/{len(init_state)}", transform=ax2.transAxes,
+                 ha='right', va='bottom', fontsize=10, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)) 
 
         obs_plot_list = self.plot_obstaces(x=init_state[0],a=0.5)
         for i in range(len(obs_plot_list)):
@@ -379,34 +389,41 @@ class PLOT():
             ee_x = np.linspace(-15, 15, N_discretization_x)
             ee_y = np.linspace(-15, 15, N_discretization_y)
 
+        # NOTE NEW: first collect all the grid states, then evaluate the critic ONCE on the whole batch
+        #           (before: 961 separate critic calls, ~25 s per plot; now ~0.5 s)
+        ics_list, idx_list = [], []
         for k_y in range(N_discretization_y):
             for k_x in range(N_discretization_x):
                 p_ee = np.array([ee_x[k_x], ee_y[k_y], 0])
                 ICS, continue_flag = self.compute_ICS(p_ee, sys_id, continue_flag=0)
+                if continue_flag:
+                    continue
                 if obstacle_state is not None:
                     ICS[-3] = obstacle_state[0]
                     ICS[-2] = obstacle_state[1]
+                ics_list.append(ICS)
+                idx_list.append((k_x, k_y))
 
-                if continue_flag:
-                    continue
+        values = np.array(critic_model(critic_params, jnp.array(np.stack(ics_list)))).reshape(-1)   # one batched call
+        for (k_x, k_y), v in zip(idx_list, values):
+            plot_data[k_x, k_y] = v
 
-                plot_data[k_x,k_y] = critic_model(critic_params, jnp.array(ICS))[0]
+        # NOTE NEW: figure created once, outside the loops (before it was created and saved at every k_y)
+        fig = plt.figure(figsize=(8,8))
+        ax = fig.add_subplot()
 
-            fig = plt.figure(figsize=(8,8))
-            ax = fig.add_subplot()
+        plt.contourf(ee_x, ee_y, plot_data.T, cmap=cm.coolwarm, antialiased=False, levels=50)
 
-            plt.contourf(ee_x, ee_y, plot_data.T, cmap=cm.coolwarm, antialiased=False, levels=50)
-
-            obs_plot_list = self.plot_obstaces(a=0.5)
-            for i in range(len(obs_plot_list)):
-                ax.add_patch(obs_plot_list[i])
-            plt.colorbar()
-            plt.title('N_try {} - n_update {}'.format(self.N_try, n_update))
-            ax.set_xlim(self.xlim)
-            ax.set_ylim(self.ylim)
-            ax.set_aspect('equal', 'box')
-            plt.savefig('{}/N_try_{}/{}_{}'.format(self.conf.Fig_path,self.N_try,name,int(n_update)))
-            plt.close()
+        obs_plot_list = self.plot_obstaces(a=0.5)
+        for i in range(len(obs_plot_list)):
+            ax.add_patch(obs_plot_list[i])
+        plt.colorbar()
+        plt.title('N_try {} - n_update {}'.format(self.N_try, n_update))
+        ax.set_xlim(self.xlim)
+        ax.set_ylim(self.ylim)
+        ax.set_aspect('equal', 'box')
+        plt.savefig('{}/N_try_{}/{}_{}'.format(self.conf.Fig_path,self.N_try,name,int(n_update)))
+        plt.close()
 
     def plot_reward_function(self, n_update, sys_id, obstacle_state=None, name='r'):
         """Plot Value function as learned by the critic"""

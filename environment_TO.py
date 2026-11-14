@@ -87,10 +87,12 @@ class SingleIntegrator_CAMS:
         self.x_next_tau = casadi.Function('x_next', [cxt, cu], [self.simulate_fun_tau(cxt,cu)])
         self.cost_tau = casadi.Function('cost', [cxt,cu], [self.cost_fun_tau(cxt,cu)])
         self.check_feasible = casadi.Function('check_ICS_feasible', [cxt], [self.check_ICS_feasible(cxt)])
+        self.constr_fun = casadi.Function('constraint_fun', [cxt], [self.constraint_fun(cxt)])
 
         self.p_ee_jax_wrapped = wrap_convert(self.p_ee)
         self.cost_tau_func_wrapped = wrap_convert(self.cost_tau)   
         self.dynamics_tau_func_wrapped = wrap_convert(self.x_next_tau)
+        self.constraint_func_wrapped = wrap_convert(self.constr_fun)
             
         self.check_feasible_wrapped = wrap_convert(self.check_feasible)    
 
@@ -152,6 +154,23 @@ class SingleIntegrator_CAMS:
         feasible_flags = casadi.mmin(ellipses) > 1
 
         return feasible_flags  
+
+    def constraint_fun(self, x):
+        """Compute constraint function g(x) for obstacle avoidance."""
+        p_ee = self.p_ee(x)
+
+        # Compute constraints violation
+        # c(x) = 1 - ( (x-xc)^2 / a^2 + (y-yc)^2 / b^2 )
+        # c_j(x) <= 0 outside obstacle j (feasible), > 0 inside
+        
+        ellipses = casadi.vertcat(
+        1 - (((p_ee[0] - self.conf.XC1) ** 2) / ((self.conf.A1 / 2) ** 2) + ((p_ee[1] - self.conf.YC1) ** 2) / ((self.conf.B1 / 2) ** 2)),
+        1- (((p_ee[0] - self.conf.XC2) ** 2) / ((self.conf.A2 / 2) ** 2) + ((p_ee[1] - self.conf.YC2) ** 2) / ((self.conf.B2 / 2) ** 2)),
+        1 - (((p_ee[0] - self.conf.XC3) ** 2) / ((self.conf.A3 / 2) ** 2) + ((p_ee[1] - self.conf.YC3) ** 2) / ((self.conf.B3 / 2) ** 2)),
+        )
+
+        return ellipses  # Return the constraint values 
+
 
 class DoubleIntegrator_CAMS:
     def __init__(self, name, conf):
